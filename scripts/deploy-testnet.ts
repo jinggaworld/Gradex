@@ -19,11 +19,23 @@ interface CliArgs {
   payment: string;
 }
 
+/** Default Wasm path (after `cargo odra build --target casper`) */
+const DEFAULT_WASM_PATH = "gradex_contracts/target/wasm32-unknown-unknown/release/gradex_contracts.wasm";
+
+/** Default contract constructor args (can be overridden via --args) */
+const DEFAULT_ARGS: Record<string, any> = {
+  name: "Gradex Vault",
+  performance_fee_bps: 200,
+  subscription_fee: "1000000000",
+  min_allocation: "100000000000",
+  max_allocation: "100000000000000",
+};
+
 function parseArgs(): CliArgs {
   const argv = process.argv.slice(2);
   const result: CliArgs = {
-    contract: "",
-    args: {},
+    contract: DEFAULT_WASM_PATH,
+    args: { ...DEFAULT_ARGS },
     rpc: "https://rpc.testnet.casper.network/rpc",
     chain: "casper-test",
     payment: "5000000000",
@@ -34,7 +46,8 @@ function parseArgs(): CliArgs {
       result.contract = argv[++i];
     } else if (argv[i] === "--args" && i + 1 < argv.length) {
       try {
-        result.args = JSON.parse(argv[++i]);
+        // Merge with defaults so partial --args doesn't lose required fields
+        result.args = { ...DEFAULT_ARGS, ...JSON.parse(argv[++i]) };
       } catch {
         console.error("Invalid --args JSON");
         process.exit(1);
@@ -63,12 +76,6 @@ async function main() {
   console.log(`RPC: ${opts.rpc}`);
   console.log(`Contract: ${opts.contract}\n`);
 
-  if (!opts.contract) {
-    console.error("❌ --contract <path> is required");
-    console.log(`\nUsage: npx ts-node scripts/deploy-testnet.ts --contract <path> --args '<json>'`);
-    process.exit(1);
-  }
-
   if (!fs.existsSync(opts.contract)) {
     console.error(`❌ Wasm file not found: ${opts.contract}`);
     console.error(`  Build contracts first: cd gradex_contracts && cargo odra build`);
@@ -83,17 +90,33 @@ async function main() {
   const CLValueBuilder = (casperSdk as any).CLValueBuilder;
   const RuntimeArgs = (casperSdk as any).RuntimeArgs;
 
-  // Load key pair
-  const homeDir = process.env.HOME || process.env.USERPROFILE || "~";
-  const keyPath = path.join(homeDir, ".casper", "testnet-key.pem");
-  if (!fs.existsSync(keyPath)) {
-    console.error(`  ❌ Deployer key not found at: ${keyPath}`);
-    console.error(`  Generate: casper-client keygen ~/.casper/testnet-key.pem`);
-    process.exit(1);
+  // Load key pair — priority: X402_PRIVATE_KEY env > PEM file > ~/.casper/testnet-key.pem
+  let hexKey = "";
+  const envKey = process.env.X402_PRIVATE_KEY;
+  if (envKey && envKey.length > 0 && envKey !== "your_x402_signing_key") {
+    hexKey = envKey;
+    console.log(`  📖 Using private key from X402_PRIVATE_KEY env`);
+  } else {
+    const homeDir = process.env.HOME || process.env.USERPROFILE || "~";
+    const keyPath = path.join(homeDir, ".casper", "testnet-key.pem");
+    if (!fs.existsSync(keyPath)) {
+      console.error(`  ❌ No private key found. Either:`);
+      console.error(`    1. Set X402_PRIVATE_KEY in .env.local`);
+      console.error(`    2. Generate key: casper-client keygen ~/.casper/testnet-key.pem`);
+      process.exit(1);
+    }
+    const pemContent = fs.readFileSync(keyPath, "utf-8");
+    hexKey = pemContent.replace(/-----.*?-----/g, "").replace(/\s/g, "").trim();
+    console.log(`  📖 Using private key from PEM file: ${keyPath}`);
   }
 
-  const pemContent = fs.readFileSync(keyPath, "utf-8");
-  const hexKey = pemContent.replace(/-----.*?-----/g, "").replace(/\s/g, "").trim();
+  // Use X402_PAYMENT_ADDRESS as owner if --args doesn't specify one
+  const paymentAddress = process.env.X402_PAYMENT_ADDRESS;
+  if (!opts.args.owner && paymentAddress && paymentAddress !== "your_payment_wallet_address") {
+    opts.args.owner = paymentAddress;
+    console.log(`  📖 Using X402_PAYMENT_ADDRESS as contract owner`);
+  }
+
   const keyPair = Keys.Ed25519.parsePrivateKey(Buffer.from(hexKey, "hex"));
 
   console.log(`Deployer: ${keyPair.publicKey.toHex()}\n`);
